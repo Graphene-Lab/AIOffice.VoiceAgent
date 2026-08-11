@@ -1,0 +1,23 @@
+# Build results
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+# Auto-downloaded at runtime on first use (Dependencies.EnsureAll / KokoroSharp)
+*.bin
+*.onnx
+
+# Runtime diagnostics
+logs/
+
+# Visual Studio files
+.vs/
+*.user
+*.suo
+*.userprefs
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+*.snupkg

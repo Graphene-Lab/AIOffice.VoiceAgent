@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <Configurations>Debug;Release;Test</Configurations>
+    <AssemblyName>AIOffice.VoiceAgent</AssemblyName>
+    <Description>Cross-platform voice agent executable (whisper.net STT + Kokoro TTS). Primary recognition on Linux/macOS, fallback on Windows.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- whisper.net: CPU runtime ships native libs for all supported RIDs (Win/Linux/macOS/Android/iOS).
+         The ggml model (~74 MB) is NOT bundled: it is downloaded automatically on first use. -->
+    <PackageReference Include="Whisper.net" Version="1.9.1" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
+    <!-- KokoroSharp.CPU: neural TTS with managed phonemization (no native espeak needed).
+         Model (~320 MB) is downloaded automatically by KokoroTTS.LoadModel* on first use; voices ship in the package. -->
+    <PackageReference Include="KokoroSharp.CPU" Version="0.8.4" />
+    <!-- NAudio: microphone capture on Windows only (Linux uses the arecord subprocess). -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+</Project>
