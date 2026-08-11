@@ -18,10 +18,36 @@ namespace AIOffice.VoiceAgent;
 /// </summary>
 public static class Dependencies
 {
-    private static readonly string ModelFileName = "ggml-base.bin";
+    /// <summary>
+    /// Whisper model size, from the <c>AIOFFICE_WHISPER_MODEL</c> environment variable
+    /// (tiny/base/small/medium/largev2/largev3). Default "small": near-perfect comprehension
+    /// (100% on the Italian dictation test) with a reasonable 466 MB download.
+    /// </summary>
+    private static readonly string ModelName = (Environment.GetEnvironmentVariable("AIOFFICE_WHISPER_MODEL") ?? "small").ToLowerInvariant();
+
+    private static GgmlType ModelType => ModelName switch
+    {
+        "tiny" => GgmlType.Tiny,
+        "small" => GgmlType.Small,
+        "medium" => GgmlType.Medium,
+        "largev2" => GgmlType.LargeV2,
+        "largev3" => GgmlType.LargeV3,
+        _ => GgmlType.Base,
+    };
 
     /// <summary>Full path of the whisper ggml model (resolved against the agent base directory).</summary>
-    public static string ModelPath { get; } = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ModelFileName);
+    public static string ModelPath { get; } = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"ggml-{ModelName}.bin");
+
+    /// <summary>Approximate download sizes (MB) per model, used to report download progress.</summary>
+    private static readonly Dictionary<string, long> ModelSizeMb = new()
+    {
+        ["tiny"] = 75,
+        ["base"] = 147,
+        ["small"] = 487,
+        ["medium"] = 1610,
+        ["largev2"] = 3090,
+        ["largev3"] = 3090,
+    };
 
     /// <summary>
     /// Ensures every dependency is present. Never throws: problems are logged and reported as
@@ -48,14 +74,32 @@ public static class Dependencies
         }
 
         Log.LogStep("Whisper model missing, downloading...");
-        ReportStatus("Downloading whisper model (ggml-base.bin, ~74 MB), first run only...");
+        ReportStatus($"Downloading whisper model (ggml-{ModelName}.bin, ~{ModelSizeMb.GetValueOrDefault(ModelName, 0)} MB), first run only...");
         try
         {
             // Download to a .tmp file, close it, then move: File.Move while the writer is still
             // open (using var semantics) throws "file in use" on Windows.
-            using (var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(GgmlType.Base))
+            using (var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(ModelType))
             using (var fileWriter = File.OpenWrite(ModelPath + ".tmp"))
-                await modelStream.CopyToAsync(fileWriter);
+            {
+                // Chunked copy with periodic progress reporting so the caller does not look stuck.
+                var buffer = new byte[128 * 1024];
+                long total = 0;
+                int read;
+                var expectedMb = ModelSizeMb.GetValueOrDefault(ModelName, 0);
+                var lastReported = -1L;
+                while ((read = await modelStream.ReadAsync(buffer)) > 0)
+                {
+                    await fileWriter.WriteAsync(buffer.AsMemory(0, read));
+                    total += read;
+                    var mb = total / (1024 * 1024);
+                    if (mb != lastReported && (mb % 10 == 0 || (expectedMb > 0 && mb >= expectedMb)))
+                    {
+                        lastReported = mb;
+                        ReportStatus($"Downloading whisper model... {mb}/{expectedMb} MB (first run only)");
+                    }
+                }
+            }
             File.Move(ModelPath + ".tmp", ModelPath, overwrite: true);
             Log.LogStep($"Whisper model downloaded: {ModelPath}");
         }

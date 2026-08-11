@@ -23,20 +23,25 @@ namespace AIOffice.VoiceAgent;
 ///   {"type":"done"}               — speak command finished
 ///   {"type":"error","text"}       — error occurred
 ///
-/// Recognition uses whisper.net (Windows primary engine stays WinRT in AIOffice.VoiceAgent.Win;
-/// this agent is the Linux/macOS engine and the Windows fallback). TTS uses KokoroSharp (neural,
-/// cross-platform; model is downloaded automatically on first use).
+/// Recognition chain per platform (primary first, fallback after):
+/// <list type="bullet">
+/// <item>Windows — WinRT agent (AIOffice.VoiceAgent.Win, external exe driven by Voice.cs), whisper as fallback.</item>
+/// <item>iOS — system speech framework first (SFSpeechRecognizer binding, implemented in the
+/// iOS/MAUI client), whisper as fallback (this engine).</item>
+/// <item>Linux/macOS — whisper only.</item>
+/// </list>
+/// TTS is Kokoro (neural, cross-platform), shared with the Windows agent through
+/// <see cref="KokoroTts"/>; the model asset lives in this project.
 /// </summary>
 public class VoiceAgent
 {
     private WhisperRecognizer? _recognizer;
 
-    /// <summary>Kokoro neural TTS engine. Loaded/downloaded in background; null if it failed.</summary>
-    private Task<KokoroTTS?>? _ttsTask;
-    private KokoroTTS? _tts;
+    /// <summary>Shared Kokoro TTS engine (model asset + voices + playback logic).</summary>
+    private KokoroTts? _tts;
 
-    /// <summary>Default Kokoro voice ("af_heart"), used when no language is specified.</summary>
-    private KokoroVoice? _voice;
+    /// <summary>Background TTS initialization task; true when the engine is ready.</summary>
+    private Task<bool>? _ttsTask;
 
     /// <summary>True while a streaming speak session is active (recognition paused between chunks).</summary>
     private bool _streamingSession;
@@ -82,6 +87,75 @@ public class VoiceAgent
             return;
         }
 
+        // --tts-file <out.wav> <text> [--lang <iso2>]: synthesize speech to a wav file and exit
+        // (no playback). Used by the end-to-end comprehension tests and to pre-generate audio.
+        int ttsFileIdx = Array.IndexOf(args, "--tts-file");
+        if (ttsFileIdx >= 0 && ttsFileIdx + 2 < args.Length)
+        {
+            Environment.CurrentDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            var lang = "it";
+            var langIdx = Array.IndexOf(args, "--lang");
+            if (langIdx >= 0 && langIdx + 1 < args.Length) lang = args[langIdx + 1];
+
+            var voicesDir = KokoroTts.FindVoicesDir();
+            if (voicesDir != null) KokoroVoiceManager.LoadVoicesFromPath(voicesDir);
+            var modelPath = KokoroTts.FindModel() ?? await KokoroLoader.DownloadModelAsync(KModel.float32);
+            using var synth = new KokoroWavSynthesizer(modelPath);
+            var voice = KokoroTts.GetVoiceForLanguage(lang) ?? KokoroVoiceManager.GetVoice("af_heart");
+            if (voice == null)
+            {
+                Console.WriteLine(JsonSerializer.Serialize(new { type = "error", text = "No TTS voice available" }));
+                return;
+            }
+            var audio = synth.Synthesize(args[ttsFileIdx + 2], voice);
+            KokoroWavSynthesizer.SaveAudioToFile(audio, args[ttsFileIdx + 1]);
+            Console.WriteLine(JsonSerializer.Serialize(new { type = "status", text = $"WAV saved: {args[ttsFileIdx + 1]} ({audio.Length} bytes)" }));
+            return;
+        }
+
+        // --transcribe <file.wav> [--lang <iso2>]: transcribe a wav file and print the text.
+        // Used by the end-to-end comprehension tests.
+        int transcribeIdx = Array.IndexOf(args, "--transcribe");
+        if (transcribeIdx >= 0 && transcribeIdx + 1 < args.Length)
+        {
+            Environment.CurrentDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            Dependencies.EnsureAll();
+            var lang = "auto";
+            var langIdx = Array.IndexOf(args, "--lang");
+            if (langIdx >= 0 && langIdx + 1 < args.Length) lang = args[langIdx + 1];
+
+            // whisper.net only accepts 16 kHz mono PCM: downmix and resample with NAudio
+            // (managed, cross-platform) before feeding the processor.
+            using var reader = new NAudio.Wave.WaveFileReader(args[transcribeIdx + 1]);
+            NAudio.Wave.ISampleProvider samples = reader.WaveFormat.Encoding == NAudio.Wave.WaveFormatEncoding.IeeeFloat
+                ? new NAudio.Wave.SampleProviders.WaveToSampleProvider(reader)
+                : new NAudio.Wave.SampleProviders.Pcm16BitToSampleProvider(reader);
+            if (reader.WaveFormat.Channels > 1)
+                samples = new NAudio.Wave.SampleProviders.StereoToMonoSampleProvider(samples);
+            if (reader.WaveFormat.SampleRate != 16000)
+                samples = new NAudio.Wave.SampleProviders.WdlResamplingSampleProvider(samples, 16000);
+            var pcm16 = new NAudio.Wave.SampleProviders.SampleToWaveProvider16(samples);
+            // WaveFileWriter disposes its target stream, so use a temp file instead of a MemoryStream.
+            var tmpWav = Path.GetTempFileName();
+            using (var writer = new NAudio.Wave.WaveFileWriter(tmpWav, new NAudio.Wave.WaveFormat(16000, 16, 1)))
+            {
+                var buf = new byte[8192];
+                int read;
+                while ((read = pcm16.Read(buf, 0, buf.Length)) > 0)
+                    writer.Write(buf, 0, read);
+            }
+
+            using var wav16 = File.OpenRead(tmpWav);
+            using var factory = WhisperFactory.FromPath(Dependencies.ModelPath);
+            using var processor = factory.CreateBuilder().WithLanguage(lang).Build();
+            var sb = new StringBuilder();
+            await foreach (var seg in processor.ProcessAsync(wav16))
+                sb.Append(seg.Text);
+            File.Delete(tmpWav);
+            Console.WriteLine(JsonSerializer.Serialize(new { type = "transcript", text = sb.ToString().Trim() }));
+            return;
+        }
+
         Environment.CurrentDirectory = AppDomain.CurrentDomain.BaseDirectory;
         Log.LogStep($"Working directory: {Environment.CurrentDirectory}");
 
@@ -113,8 +187,8 @@ public class VoiceAgent
         // recognition must not wait for it.
         StartTtsBackground();
 
-        WriteJson(new { type = "ready", tts = FindKokoroModel() != null ? "kokoro" : "kokoro (downloading)" });
-        Log.LogStep($"Ready sent, TTS={FindKokoroModel() != null}");
+        WriteJson(new { type = "ready", tts = KokoroTts.FindModel() != null ? "kokoro" : "kokoro (downloading)" });
+        Log.LogStep($"Ready sent, TTS={KokoroTts.FindModel() != null}");
 
         try
         {
@@ -172,63 +246,14 @@ public class VoiceAgent
             Log.LogStep("=== VoiceAgent shutting down ===");
             StopAll();
             _recognizer?.Dispose();
+            _tts?.Dispose();
         }
     }
 
     private void StartTtsBackground()
     {
-        _ttsTask = Task.Run(async () =>
-        {
-            try
-            {
-                var voicesDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "voices");
-                if (Directory.Exists(voicesDir))
-                    KokoroVoiceManager.LoadVoicesFromPath(voicesDir);
-
-                var modelPath = FindKokoroModel();
-                KokoroTTS tts;
-                if (modelPath != null)
-                {
-                    // The model is a build/publish asset of the app (AIOffice base dir); reuse it
-                    // instead of downloading a duplicate copy.
-                    Log.LogStep($"Kokoro model reused from: {modelPath}");
-                    tts = KokoroTTS.LoadModel(modelPath);
-                }
-                else
-                {
-                    Log.LogStep("Kokoro model not found, downloading (one-time, ~320 MB)...");
-                    WriteJson(new { type = "status", text = "Downloading Kokoro TTS model (~320 MB), first run only..." });
-                    tts = await KokoroTTS.LoadModelAsync(KModel.float32);
-                }
-
-                _voice = KokoroVoiceManager.GetVoice("af_heart");
-                _tts = tts;
-                Log.LogStep("Kokoro TTS loaded successfully");
-                WriteJson(new { type = "status", text = "TTS ready (Kokoro)" });
-                return tts;
-            }
-            catch (Exception ex)
-            {
-                Log.LogStep($"Kokoro TTS failed: {ex.Message}");
-                WriteJson(new { type = "status", text = $"TTS unavailable: {ex.Message}" });
-                return null;
-            }
-        });
-    }
-
-    /// <summary>
-    /// Locates the Kokoro ONNX model: the agent's own directory (standalone runs) or the parent
-    /// directory (the app base dir, where the build-time <c>kokoro.onnx</c> asset is deployed).
-    /// </summary>
-    private static string? FindKokoroModel()
-    {
-        var baseDir = AppDomain.CurrentDomain.BaseDirectory;
-        var candidates = new[]
-        {
-            Path.Combine(baseDir, "kokoro.onnx"),
-            Path.Combine(baseDir, "..", "kokoro.onnx"),
-        };
-        return candidates.FirstOrDefault(File.Exists);
+        _tts = new KokoroTts(s => WriteJson(new { type = "status", text = s }), _ttsMethod);
+        _ttsTask = Task.Run(_tts.InitializeAsync);
     }
 
     // ─── TTS ──────────────────────────────────────────────────────────────
@@ -245,7 +270,6 @@ public class VoiceAgent
             return;
         }
 
-        text = StripMarkdown(text);
         var effectiveLang = langCode ?? _recognitionLang;
         Log.LogStep($"Speak: text_len={text.Length}, lang={effectiveLang ?? "auto"}, streaming={streaming}");
 
@@ -278,35 +302,15 @@ public class VoiceAgent
         }
 
         // First use blocks until the model download/load completes; later calls return immediately.
-        var tts = await _ttsTask;
-        if (tts == null)
+        if (!await _ttsTask || _tts == null)
         {
             WriteError("TTS engine not available");
             return;
         }
 
-        KokoroVoice? voice = null;
-        bool langUnsupported = false;
-        if (effectiveLang != null)
-        {
-            voice = GetVoiceForLanguage(effectiveLang);
-            langUnsupported = voice == null;
-        }
-
-        if (voice != null)
-        {
-            Log.LogStep("Speaking with Kokoro (language-specific voice)");
-            await SpeakWithKokoroAsync(tts, text, voice);
-        }
-        else if (!langUnsupported && _voice != null)
-        {
-            Log.LogStep("Speaking with Kokoro (default voice)");
-            await SpeakWithKokoroAsync(tts, text, _voice);
-        }
-        else
+        if (!await _tts.SpeakAsync(text, effectiveLang))
         {
             WriteError($"No TTS voice for language '{effectiveLang}'");
-            Log.LogStep($"No voice for language {effectiveLang}");
         }
 
         if (!streaming)
@@ -316,49 +320,6 @@ public class VoiceAgent
             _recognizer?.Start(_recognitionLang);
             Log.LogStep("Recognition restarted after speak");
         }
-    }
-
-    private async Task SpeakWithKokoroAsync(KokoroTTS tts, string text, KokoroVoice voice)
-    {
-        Log.LogStep($"Kokoro TTS starting (method={_ttsMethod})");
-        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        void OnCompleted(SpeechCompletionPacket _) => tcs.TrySetResult();
-        void OnCanceled(SpeechCancellationPacket _) => tcs.TrySetResult();
-        tts.OnSpeechCompleted += OnCompleted;
-        tts.OnSpeechCanceled += OnCanceled;
-        try
-        {
-            if (_ttsMethod == "full")
-                tts.Speak(text, voice);
-            else
-                tts.SpeakFast(text, voice);
-            await tcs.Task;
-            Log.LogStep("Kokoro TTS completed");
-        }
-        finally
-        {
-            tts.OnSpeechCompleted -= OnCompleted;
-            tts.OnSpeechCanceled -= OnCanceled;
-        }
-    }
-
-    private static KokoroVoice? GetVoiceForLanguage(string langCode)
-    {
-        var voiceName = langCode switch
-        {
-            "it" => "if_sara",
-            "en" => "af_heart",
-            "fr" => "ff_siwis",
-            "es" => "ef_dora",
-            "ja" => "jf_alpha",
-            "zh" => "zf_xiaobei",
-            "hi" => "hf_alpha",
-            "pt" => "pf_dora",
-            _ => null,
-        };
-        if (voiceName == null) return null;
-        try { return KokoroVoiceManager.GetVoice(voiceName); }
-        catch { return null; }
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────
@@ -382,56 +343,5 @@ public class VoiceAgent
     private static void WriteError(string message)
     {
         WriteJson(new { type = "error", text = message });
-    }
-
-    private static string StripMarkdown(string text)
-    {
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"```[\s\S]*?```", "");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"`([^`]+)`", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"!\[([^\]]*)\]\([^)]+\)", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\[([^\]]*)\]\([^)]+\)", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\*\*\*(.+?)\*\*\*", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\*\*(.+?)\*\*", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\*(.+?)\*", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"~~(.+?)~~", "$1");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^#{1,6}\s+", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^>\s?", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^[\-\*\+]\s+", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^\d+\.\s+", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"^[\-\*\s_]{3,}$", "", System.Text.RegularExpressions.RegexOptions.Multiline);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\|-+\|", "");
-        // Newlines not preceded by punctuation become ", "; otherwise a single \n stays as a pause.
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"(?<![.?!])\n", ", ");
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"[ \t]{2,}", " ");
-        text = FilterSpeakableChars(text);
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"\n{3,}", "\n\n");
-        return text.Trim();
-    }
-
-    private static string FilterSpeakableChars(string text)
-    {
-        var result = new StringBuilder(text.Length);
-        for (int i = 0; i < text.Length; i++)
-        {
-            var cat = CharUnicodeInfo.GetUnicodeCategory(text, i);
-            if (cat is UnicodeCategory.UppercaseLetter or UnicodeCategory.LowercaseLetter
-                or UnicodeCategory.TitlecaseLetter or UnicodeCategory.ModifierLetter
-                or UnicodeCategory.OtherLetter or UnicodeCategory.DecimalDigitNumber
-                or UnicodeCategory.LetterNumber or UnicodeCategory.OtherNumber
-                or UnicodeCategory.SpaceSeparator or UnicodeCategory.LineSeparator
-                or UnicodeCategory.ParagraphSeparator or UnicodeCategory.DashPunctuation
-                or UnicodeCategory.OpenPunctuation or UnicodeCategory.ClosePunctuation
-                or UnicodeCategory.InitialQuotePunctuation or UnicodeCategory.FinalQuotePunctuation
-                or UnicodeCategory.OtherPunctuation or UnicodeCategory.CurrencySymbol
-                or UnicodeCategory.MathSymbol)
-            {
-                result.Append(text[i]);
-            }
-            else if (cat == UnicodeCategory.Surrogate)
-            {
-                i++;
-            }
-        }
-        return result.ToString();
     }
 }

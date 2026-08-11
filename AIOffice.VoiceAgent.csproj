@@ -25,4 +25,30 @@
     <PackageReference Include="NAudio" Version="2.2.1" />
   </ItemGroup>
 
+  <!-- KokoroSharp's buildTransitive target copies the voices to $(OutputPath) but the publish
+       pipeline does not carry them to $(PublishDir). Reproduce that copy after Publish so a
+       standalone published agent can load voices (KokoroVoiceManager.GetVoice requires them). -->
+  <Target Name="CopyKokoroVoicesToPublish" AfterTargets="Publish"
+          Condition="'$(PublishDir)' != '' and Exists('$(OutputPath)voices\')">
+    <ItemGroup>
+      <_KokoroVoices Include="$(OutputPath)voices\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_KokoroVoices)"
+          DestinationFiles="@(_KokoroVoices->'$(PublishDir)voices\%(RecursiveDir)%(Filename)%(Extension)')" />
+  </Target>
+
+  <!-- Provide kokoro.onnx in the output directory (the 325 MB model binary is not tracked in git).
+       This is the single home of the Kokoro model asset: AIOffice.VoiceAgent.Win no longer
+       downloads its own copy and reuses this one (deployed at the app base dir by the build). -->
+  <Target Name="DownloadKokoroModel" BeforeTargets="Build;Publish"
+          Condition="!Exists('$(OutputPath)kokoro.onnx')">
+    <MakeDir Directories="$(OutputPath)" />
+    <Copy Condition="Exists('kokoro.onnx')"
+          SourceFiles="kokoro.onnx"
+          DestinationFiles="$(OutputPath)kokoro.onnx" />
+    <Exec Condition="!Exists('$(OutputPath)kokoro.onnx')"
+          Command="curl.exe -L --fail -o &quot;$(OutputPath)kokoro.onnx&quot; &quot;https://github.com/Lyrcaxis/KokoroSharpBinaries/releases/download/v2.0.0/kokoro.onnx&quot;" />
+    <Message Text="kokoro.onnx ready at $(OutputPath)" Importance="high" />
+  </Target>
+
 </Project>
