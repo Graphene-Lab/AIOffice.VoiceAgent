@@ -145,14 +145,20 @@ public class VoiceAgent
                     writer.Write(buf, 0, read);
             }
 
-            using var wav16 = File.OpenRead(tmpWav);
-            using var factory = WhisperFactory.FromPath(Dependencies.ModelPath);
-            using var processor = factory.CreateBuilder().WithLanguage(lang).Build();
-            var sb = new StringBuilder();
-            await foreach (var seg in processor.ProcessAsync(wav16))
-                sb.Append(seg.Text);
+            string text;
+            using (var wav16 = File.OpenRead(tmpWav))
+            using (var factory = WhisperFactory.FromPath(Dependencies.ModelPath))
+            using (var processor = factory.CreateBuilder().WithLanguage(lang).Build())
+            {
+                var sb = new StringBuilder();
+                await foreach (var seg in processor.ProcessAsync(wav16))
+                    sb.Append(seg.Text);
+                text = sb.ToString().Trim();
+            }
+            // Delete AFTER every handle on the file is closed: on Windows File.Delete fails
+            // while a stream is still open ("file in use") — POSIX unlink would hide the bug.
             File.Delete(tmpWav);
-            Console.WriteLine(JsonSerializer.Serialize(new { type = "transcript", text = sb.ToString().Trim() }));
+            Console.WriteLine(JsonSerializer.Serialize(new { type = "transcript", text }));
             return;
         }
 
