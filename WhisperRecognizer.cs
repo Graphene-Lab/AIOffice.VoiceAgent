@@ -24,6 +24,13 @@ public sealed class WhisperRecognizer : IAgentRecognizer
     private const int MinUtteranceMs = 350;
     private const int MaxUtteranceMs = 30_000;
     private const double MinThreshold = 0.006;
+    // Adaptive ambient (B): the first ~1 s of a call is the background level (hiss, room, street,
+    // beach). Speech threshold = ambient × VadRatio, so the VAD self-tunes to the environment
+    // instead of a fixed value that would either stay open on hiss or cut speech in loud places.
+    private const double VadRatio = 2.0;
+    private const int CalibFrames = 100;             // 1 s @ 10 ms
+    private const double AmbientAlphaDown = 0.05;    // fast release toward quiet dips
+    private const double AmbientAlphaUp = 0.001;     // very slow attack: speech must not inflate it
 
     private readonly object _sync = new();
     private WhisperFactory? _factory;
@@ -51,8 +58,19 @@ public sealed class WhisperRecognizer : IAgentRecognizer
     // VAD state
     private MemoryStream _utterance = new();
     private DateTime _speechStart;
-    private double _noiseFloor = 0.004;
     private int _hangover;
+    private double _ambient = MinThreshold;
+    private int _calibCount;
+
+    /// <summary>
+    /// (A) Manual silence threshold override (RMS, normalized 0..1). When &gt; 0 it acts as the
+    /// FLOOR of the speech threshold (the adaptive ambient from B still applies on top). Set via
+    /// the <c>AIOFFICE_VAD_THRESHOLD</c> environment variable (e.g. 0.02) when the auto-adaptation
+    /// is not enough — or leave 0 to rely on the per-call ambient calibration. NOTE: a threshold
+    /// that works for loud ambient (beach/street) would cut quiet speech — prefer the adaptive
+    /// path; this is only a floor.
+    /// </summary>
+    public double ManualThreshold { get; set; }
 
     /// <summary>Starts capturing and recognizing. Idempotent. Null/empty language means auto-detect.
     /// When <paramref name="externalInput"/> is true no microphone is opened: audio arrives via
@@ -65,7 +83,19 @@ public sealed class WhisperRecognizer : IAgentRecognizer
             _language = string.IsNullOrWhiteSpace(language) ? "auto" : language;
             _externalInput = externalInput;
             _captureCts = new CancellationTokenSource();
-            Log.LogStep($"WhisperRecognizer starting (lang={_language}, externalInput={externalInput})");
+
+            // (A) Optional manual silence-threshold override from the environment (the SIP bridge
+            // sets it when Sip:VadThreshold is configured); 0 = rely on the per-call calibration.
+            if (ManualThreshold == 0 && double.TryParse(
+                    Environment.GetEnvironmentVariable("AIOFFICE_VAD_THRESHOLD"),
+                    System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var manual))
+                ManualThreshold = Math.Clamp(manual, 0.0, 0.5);
+
+            // Fresh ambient calibration for this call.
+            _ambient = MinThreshold;
+            _calibCount = 0;
+
+            Log.LogStep($"WhisperRecognizer starting (lang={_language}, externalInput={externalInput}, manualThreshold={ManualThreshold:0.000})");
 
             try
             {
@@ -226,7 +256,26 @@ public sealed class WhisperRecognizer : IAgentRecognizer
 
     private void UpdateVad(double rms)
     {
-        var threshold = Math.Max(_noiseFloor * 3.5, MinThreshold);
+        // (B) Adaptive ambient: calibrate from the first ~1 s (the background of the call), then
+        // track it asymmetrically — fast down on quiet dips, very slow up so speech never inflates
+        // it. Speech threshold = ambient × VadRatio (floored by the manual override). This keeps a
+        // phrase from staying open forever on hiss AND from cutting quiet speech in loud places.
+        if (_calibCount < CalibFrames)
+        {
+            _calibCount++;
+            if (rms > 0 && rms < _ambient) _ambient = rms;   // seed with the quietest calibration frame
+        }
+        else if (rms < _ambient)
+        {
+            _ambient += (rms - _ambient) * AmbientAlphaDown;
+        }
+        else if (_hangover > 0 || _speechStart == default)
+        {
+            // Only ambient periods (not speech) may raise the estimate — and very slowly.
+            _ambient += (rms - _ambient) * AmbientAlphaUp;
+        }
+
+        var threshold = Math.Max(_ambient * VadRatio, Math.Max(ManualThreshold, MinThreshold));
         var now = DateTime.UtcNow;
 
         if (_hangover > 0) // hangover state: silence after speech
@@ -250,12 +299,6 @@ public sealed class WhisperRecognizer : IAgentRecognizer
         else if (rms > threshold) // idle → speech start
         {
             _speechStart = now;
-        }
-        else
-        {
-            // idle: keep the noise floor tracking ambient level
-            _noiseFloor = Math.Min(_noiseFloor, Math.Max(rms, 0.0005));
-            _noiseFloor = _noiseFloor * 0.995 + Math.Min(rms, threshold) * 0.005;
         }
     }
 

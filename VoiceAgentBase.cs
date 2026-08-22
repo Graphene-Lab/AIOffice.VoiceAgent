@@ -159,6 +159,10 @@ public abstract class VoiceAgentBase
                         case "start":
                             RecognitionLang = root.TryGetProperty("lang", out var sl) ? sl.GetString() : null;
                             Log.LogStep($"Start command (lang={RecognitionLang ?? "auto"}, pipe={PipeAudio})");
+                            // Pipe mode: the recognizer must consume externally-fed PCM
+                            // ({"cmd":"audio"}), not the microphone — set BEFORE StartAsync, or
+                            // FeedExternalPcm silently drops every chunk and STT stays silent.
+                            Recognizer.ExternalInput = PipeAudio;
                             await StartRecognitionAsync(RecognitionLang);
                             break;
 
