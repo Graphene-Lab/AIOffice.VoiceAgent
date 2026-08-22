@@ -264,6 +264,8 @@ public sealed class WhisperRecognizer : IAgentRecognizer
         {
             _calibCount++;
             if (rms > 0 && rms < _ambient) _ambient = rms;   // seed with the quietest calibration frame
+            if (_calibCount == CalibFrames)
+                Log.LogStep($"VAD calibration done: ambient={_ambient:F4} threshold={Math.Max(_ambient * VadRatio, Math.Max(ManualThreshold, MinThreshold)):F4}");
         }
         else if (rms < _ambient)
         {
@@ -282,22 +284,28 @@ public sealed class WhisperRecognizer : IAgentRecognizer
         {
             if (rms > threshold)
             {
+                Log.LogStep($"VAD hangover RESET rms={rms:F4} threshold={threshold:F4} (speech resumed)");
                 _hangover = 0; // speech resumed, keep collecting
             }
             else if (++_hangover >= HangoverFrames)
             {
+                Log.LogStep($"VAD FLUSH after hangover ({_hangover} frames = {_hangover * 10} ms)");
                 FlushUtteranceLocked();
             }
         }
         else if (_speechStart != default) // speech state
         {
             if (rms <= threshold)
+            {
+                Log.LogStep($"VAD hangover START rms={rms:F4} threshold={threshold:F4}");
                 _hangover = 1;
+            }
             else if ((now - _speechStart).TotalMilliseconds > MaxUtteranceMs)
                 FlushUtteranceLocked();
         }
         else if (rms > threshold) // idle → speech start
         {
+            Log.LogStep($"VAD speech START rms={rms:F4} threshold={threshold:F4} ambient={_ambient:F4}");
             _speechStart = now;
         }
     }

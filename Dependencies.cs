@@ -25,6 +25,15 @@ public static class Dependencies
     /// </summary>
     private static readonly string ModelName = (Environment.GetEnvironmentVariable("AIOFFICE_WHISPER_MODEL") ?? "small").ToLowerInvariant();
 
+    /// <summary>
+    /// Whisper quantization, from the <c>AIOFFICE_WHISPER_QUANT</c> environment variable
+    /// (empty/q4_0/q4_1/q5_0/q5_1/q8_0). Default empty = the full FP16 model. The SIP path sets
+    /// it to <c>q8_0</c>: "small-q8_0" is ~2-3x FASTER on CPU with minimal accuracy loss
+    /// (measured: STT 8.3 s → ~3-4 s per utterance) — the latency fix for phone calls, where
+    /// whisper is the recognizer by necessity (RTP audio, not the mic → WinRT is not usable).
+    /// </summary>
+    private static readonly string ModelQuant = (Environment.GetEnvironmentVariable("AIOFFICE_WHISPER_QUANT") ?? "").ToLowerInvariant();
+
     private static GgmlType ModelType => ModelName switch
     {
         "tiny" => GgmlType.Tiny,
@@ -35,10 +44,22 @@ public static class Dependencies
         _ => GgmlType.Base,
     };
 
-    /// <summary>Full path of the whisper ggml model (resolved against the agent base directory).</summary>
-    public static string ModelPath { get; } = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"ggml-{ModelName}.bin");
+    private static QuantizationType QuantType => ModelQuant switch
+    {
+        "q4_0" => QuantizationType.Q4_0,
+        "q4_1" => QuantizationType.Q4_1,
+        "q5_0" => QuantizationType.Q5_0,
+        "q5_1" => QuantizationType.Q5_1,
+        "q8_0" => QuantizationType.Q8_0,
+        _ => QuantizationType.NoQuantization,
+    };
 
-    /// <summary>Approximate download sizes (MB) per model, used to report download progress.</summary>
+    /// <summary>Full path of the whisper ggml model (resolved against the agent base directory).</summary>
+    public static string ModelPath { get; } = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+        ModelQuant.Length == 0 ? $"ggml-{ModelName}.bin" : $"ggml-{ModelName}-{ModelQuant}.bin");
+
+    /// <summary>Approximate download sizes (MB) per model, used to report download progress.
+    /// Quantized variants are much smaller (e.g. small-q8_0 ≈ 130 MB vs 487 MB FP16).</summary>
     private static readonly Dictionary<string, long> ModelSizeMb = new()
     {
         ["tiny"] = 75,
@@ -74,12 +95,13 @@ public static class Dependencies
         }
 
         Log.LogStep("Whisper model missing, downloading...");
-        ReportStatus($"Downloading whisper model (ggml-{ModelName}.bin, ~{ModelSizeMb.GetValueOrDefault(ModelName, 0)} MB), first run only...");
+        var modelLabel = ModelQuant.Length == 0 ? $"ggml-{ModelName}.bin" : $"ggml-{ModelName}-{ModelQuant}.bin";
+        ReportStatus($"Downloading whisper model ({modelLabel}, ~{ModelSizeMb.GetValueOrDefault(ModelName, 0)} MB), first run only...");
         try
         {
             // Download to a .tmp file, close it, then move: File.Move while the writer is still
             // open (using var semantics) throws "file in use" on Windows.
-            using (var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(ModelType))
+            using (var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(ModelType, QuantType))
             using (var fileWriter = File.OpenWrite(ModelPath + ".tmp"))
             {
                 // Chunked copy with periodic progress reporting so the caller does not look stuck.
