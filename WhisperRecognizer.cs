@@ -18,6 +18,11 @@ public sealed class WhisperRecognizer : IAgentRecognizer
     /// <summary>Raised when recognition cannot continue (mic, model or native runtime failure).</summary>
     public event Action<string>? Error;
 
+    /// <summary>Raised on VAD transitions: "speech" (utterance opened) / "end" (utterance closed,
+    /// transcription started). Consumed by the SIP bridge to arm the processing indicator at the
+    /// right time — see <see cref="IAgentRecognizer.VadState"/>.</summary>
+    public event Action<string>? VadState;
+
     private const int SampleRate = 16000;
     private const int FrameSamples = 160;            // 10 ms frame
     private const int HangoverFrames = 70;           // 700 ms of silence ends an utterance
@@ -307,6 +312,7 @@ public sealed class WhisperRecognizer : IAgentRecognizer
         {
             Log.LogStep($"VAD speech START rms={rms:F4} threshold={threshold:F4} ambient={_ambient:F4}");
             _speechStart = now;
+            VadState?.Invoke("speech");
         }
     }
 
@@ -327,6 +333,7 @@ public sealed class WhisperRecognizer : IAgentRecognizer
 
         Log.LogStep($"Utterance complete ({duration:F0} ms, {bytes.Length / 2} samples), transcribing...");
         _transcribing = true;
+        VadState?.Invoke("end");   // utterance closed → transcription started (the bridge arms the indicator here)
         _ = Task.Run(async () =>
         {
             try

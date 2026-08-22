@@ -14,6 +14,14 @@ public interface IAgentRecognizer : IDisposable
     /// <summary>Raised on a recognizer error.</summary>
     event Action<string>? Error;
 
+    /// <summary>Raised when the recognizer's VAD changes state: "speech" (the caller started
+    /// talking — the utterance is open) or "end" (the utterance closed and transcription began).
+    /// Lets the SIP media bridge arm the processing indicator at the RIGHT moment (speech end =
+    /// processing start) instead of waiting for the transcript, which can arrive seconds later
+    /// (whisper inference) or never (noise kept the utterance open). Recognizers without an
+    /// explicit VAD (WinRT) simply never raise it.</summary>
+    event Action<string>? VadState;
+
     /// <summary>True when the recognizer consumes externally-fed PCM ({"cmd":"audio"}) instead of
     /// capturing from the microphone. Set by the base before <see cref="StartAsync"/>.</summary>
     bool ExternalInput { get; set; }

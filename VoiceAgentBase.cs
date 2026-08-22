@@ -119,6 +119,7 @@ public abstract class VoiceAgentBase
         Recognizer = CreateRecognizer();
         Recognizer.Transcript += text => WriteJson(new { type = "transcript", text });
         Recognizer.Error += message => WriteError(message);
+        Recognizer.VadState += state => WriteJson(new { type = "vad", state });
 
         await InitializeTtsAsync();
 
