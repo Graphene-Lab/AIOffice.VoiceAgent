@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net10.0;net10.0-windows</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <GenerateDocumentationFile>True</GenerateDocumentationFile>
@@ -15,7 +15,12 @@
 
   <ItemGroup>
     <!-- whisper.net: CPU runtime ships native libs for all supported RIDs (Win/Linux/macOS/Android/iOS).
-         The ggml model (~74 MB) is NOT bundled: it is downloaded automatically on first use. -->
+         The ggml model is NOT bundled: it is downloaded automatically on first use.
+         GPU runtimes (CUDA12/Vulkan) are OFF by default: on Turing-class GPUs (sm_75, e.g. GTX 16xx)
+         the CUDA builds fail to load and the loader falls back to CPU WITH ~1.4s probe overhead per
+         model load. On Ampere+ (RTX 30xx/40xx) enable them by uncommenting the lines below:
+         <PackageReference Include="Whisper.net.Runtime.Cuda12" Version="1.9.1" />
+         <PackageReference Include="Whisper.net.Runtime.Vulkan" Version="1.9.1" /> -->
     <PackageReference Include="Whisper.net" Version="1.9.1" />
     <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
     <!-- KokoroSharp.CPU: neural TTS with managed phonemization (no native espeak needed).
@@ -23,6 +28,9 @@
     <PackageReference Include="KokoroSharp.CPU" Version="0.8.4" />
     <!-- NAudio: microphone capture on Windows only (Linux uses the arecord subprocess). -->
     <PackageReference Include="NAudio" Version="2.2.1" />
+    <!-- System.Speech: Windows SAPI synthesizer — TTS fallback when Kokoro is unavailable or the
+         language is unsupported (architectural priority OS→NuGet). Windows TFM only. -->
+    <PackageReference Include="System.Speech" Version="9.0.0" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
   </ItemGroup>
 
   <!-- KokoroSharp's buildTransitive target copies the voices to $(OutputPath) but the publish

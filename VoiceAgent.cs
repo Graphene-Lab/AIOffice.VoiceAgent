@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using KokoroSharp;
@@ -9,58 +8,27 @@ using Whisper.net;
 namespace AIOffice.VoiceAgent;
 
 /// <summary>
-/// Cross-platform voice agent executable. Communicates via JSON Lines on stdin/stdout.
+/// Cross-platform voice agent executable — the platform-neutral subclass of
+/// <see cref="VoiceAgentBase"/>: whisper STT + Kokoro TTS, no OS fallback. Used standalone
+/// (microphone capture) and by the SIP media bridge ({"cmd":"audio"} pipe mode +
+/// {"cmd":"speak","render":true} PCM output). Everything shared with the Windows agent lives in
+/// the base — this class only wires whisper and the one-shot CLI commands.
 ///
 /// Protocol (stdin):
-///   {"cmd":"start"}                         — begin speech recognition
-///   {"cmd":"speak","text":"…","lang":"…"}   — speak text, then resume recognition
-///   {"cmd":"stop"}                          — stop recognition and exit
+///   {"cmd":"start","lang":…}              — begin recognition (or pipe mode with --pipe-audio)
+///   {"cmd":"audio","b64":…}               — external 16 kHz PCM16 chunk (SIP media bridge)
+///   {"cmd":"speak","text":…,"lang":…,"streaming":bool,"render":bool} — speak / render to PCM
+///   {"cmd":"stop"}                        — stop recognition and exit
 ///
 /// Protocol (stdout):
-///   {"type":"ready"}              — process initialized (tts field indicates engine)
-///   {"type":"transcript","text"}  — user speech recognized
-///   {"type":"status","text"}      — progress of the automatic dependency setup
-///   {"type":"done"}               — speak command finished
-///   {"type":"error","text"}       — error occurred
-///
-/// Recognition chain per platform (primary first, fallback after):
-/// <list type="bullet">
-/// <item>Windows — WinRT agent (AIOffice.VoiceAgent.Win, external exe driven by Voice.cs), whisper as fallback.</item>
-/// <item>iOS — system speech framework first (SFSpeechRecognizer binding, implemented in the
-/// iOS/MAUI client), whisper as fallback (this engine).</item>
-/// <item>Linux/macOS — whisper only.</item>
-/// </list>
-/// TTS is Kokoro (neural, cross-platform), shared with the Windows agent through
-/// <see cref="KokoroTts"/>; the model asset lives in this project.
+///   {"type":"ready"} | {"type":"transcript","text"} | {"type":"audio","b64":…,"rate":24000}
+///   | {"type":"status","text"} | {"type":"done"} | {"type":"error","text"}
 /// </summary>
-public class VoiceAgent
+public class VoiceAgentCross : VoiceAgentBase
 {
-    private WhisperRecognizer? _recognizer;
-
-    /// <summary>Shared Kokoro TTS engine (model asset + voices + playback logic).</summary>
-    private KokoroTts? _tts;
-
-    /// <summary>Background TTS initialization task; true when the engine is ready.</summary>
-    private Task<bool>? _ttsTask;
-
-    /// <summary>True while a streaming speak session is active (recognition paused between chunks).</summary>
-    private bool _streamingSession;
-
-    /// <summary>TTS processing mode: Fast (SpeakFast, default) or Full (Speak).</summary>
-    private string _ttsMethod = "fast";
-
-    /// <summary>Language code passed with the last "start" command (e.g. "it"). Null = auto-detect.</summary>
-    private string? _recognitionLang;
-
-    private CancellationTokenSource? _shutdownCts;
-
-    // ─── Entry point ──────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Entry point. Supports <c>--check</c> (dependency self-test), <c>--debug</c> (attach a
-    /// debugger) and <c>--tts-method full|fast</c> (TTS mode; fast is the default). Runs the
-    /// automatic dependency setup, then enters the stdin command loop.
-    /// </summary>
+    /// <summary>Entry point. Supports <c>--check</c> (dependency self-test), <c>--debug</c>,
+    /// <c>--tts-method full|fast</c>, <c>--pipe-audio</c> (SIP media bridge), <c>--no-system-libs</c>
+    /// (test switch) and the one-shot <c>--tts-file</c>/<c>--transcribe</c> commands.</summary>
     public static async Task Main(string[] args)
     {
         Log.Initialize(Log.IsEnabled);
@@ -170,184 +138,24 @@ public class VoiceAgent
             if (args[i] == "--tts-method" && args[i + 1] == "full")
                 ttsMethod = "full";
 
-        var agent = new VoiceAgent { _ttsMethod = ttsMethod };
+        var agent = new VoiceAgentCross
+        {
+            TtsMethod = ttsMethod,
+            PipeAudio = args.Contains("--pipe-audio"),
+            NoSystemLibs = args.Contains("--no-system-libs"),
+        };
         await agent.RunAsync();
         Log.LogStep("=== VoiceAgent exited ===");
     }
 
-    // ─── Main loop ────────────────────────────────────────────────────────
+    /// <summary>whisper STT — the cross-platform recognizer (VAD + whisper.net).</summary>
+    protected override IAgentRecognizer CreateRecognizer() => new WhisperRecognizer();
 
-    private async Task RunAsync()
-    {
-        _shutdownCts = new CancellationTokenSource();
+    /// <summary>Downloads the whisper model + native runtime on first run.</summary>
+    protected override void EnsureDependencies() => Dependencies.EnsureAll();
 
-        // Automatic dependency setup (model download on first run) before reporting ready,
-        // so recognition is functional the moment Voice.cs sends "start".
-        Dependencies.EnsureAll();
-
-        _recognizer = new WhisperRecognizer();
-        _recognizer.Transcript += text => WriteJson(new { type = "transcript", text });
-        _recognizer.Error += message => WriteError(message);
-
-        // TTS loads in the background (first use downloads the ~320 MB Kokoro model);
-        // recognition must not wait for it.
-        StartTtsBackground();
-
-        WriteJson(new { type = "ready", tts = KokoroTts.FindModel() != null ? "kokoro" : "kokoro (downloading)" });
-        Log.LogStep($"Ready sent, TTS={KokoroTts.FindModel() != null}");
-
-        try
-        {
-            while (!_shutdownCts.Token.IsCancellationRequested)
-            {
-                var line = await Console.In.ReadLineAsync();
-                if (line == null)
-                {
-                    Log.LogStep("stdin EOF, exiting main loop");
-                    break;
-                }
-
-                Log.LogStep($"stdin cmd: {line}");
-
-                JsonDocument doc;
-                try { doc = JsonDocument.Parse(line); }
-                catch
-                {
-                    Log.LogStep($"Invalid JSON from stdin: {line}");
-                    continue;
-                }
-
-                using (doc)
-                {
-                    var root = doc.RootElement;
-                    var cmd = root.TryGetProperty("cmd", out var c) ? c.GetString() : null;
-
-                    switch (cmd)
-                    {
-                        case "start":
-                            _recognitionLang = root.TryGetProperty("lang", out var sl) ? sl.GetString() : null;
-                            Log.LogStep($"Start command (lang={_recognitionLang ?? "auto"})");
-                            _recognizer.Start(_recognitionLang);
-                            break;
-
-                        case "speak":
-                            var text = root.TryGetProperty("text", out var t) ? t.GetString() : "";
-                            var lang = root.TryGetProperty("lang", out var l) ? l.GetString() : null;
-                            var streaming = root.TryGetProperty("streaming", out var s) && s.GetBoolean();
-                            Log.LogStep($"Speak: lang={lang}, streaming={streaming}, text_len={text?.Length ?? 0}");
-                            await SpeakAndPauseRecognitionAsync(text, lang, streaming);
-                            WriteJson(new { type = "done" });
-                            break;
-
-                        case "stop":
-                            Log.LogStep("Stop command received");
-                            StopAll();
-                            return;
-                    }
-                }
-            }
-        }
-        finally
-        {
-            Log.LogStep("=== VoiceAgent shutting down ===");
-            StopAll();
-            _recognizer?.Dispose();
-            _tts?.Dispose();
-        }
-    }
-
-    private void StartTtsBackground()
-    {
-        _tts = new KokoroTts(s => WriteJson(new { type = "status", text = s }), _ttsMethod);
-        _ttsTask = Task.Run(_tts.InitializeAsync);
-    }
-
-    // ─── TTS ──────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Stops recognition, speaks the text, then restarts recognition.
-    /// Uses Kokoro neural TTS when available.
-    /// </summary>
-    private async Task SpeakAndPauseRecognitionAsync(string? text, string? langCode = null, bool streaming = false)
-    {
-        if (string.IsNullOrEmpty(text))
-        {
-            Log.LogStep("Speak skipped: empty text");
-            return;
-        }
-
-        var effectiveLang = langCode ?? _recognitionLang;
-        Log.LogStep($"Speak: text_len={text.Length}, lang={effectiveLang ?? "auto"}, streaming={streaming}");
-
-        if (streaming)
-        {
-            if (!_streamingSession)
-            {
-                _streamingSession = true;
-                Log.LogStep("First streaming chunk: pausing recognition");
-                _recognizer?.Stop();
-                await Task.Delay(300);
-            }
-        }
-        else if (_streamingSession)
-        {
-            _streamingSession = false;
-            Log.LogStep("Final streaming chunk: ending streaming session");
-        }
-        else
-        {
-            Log.LogStep("Non-streaming speak: stopping recognition");
-            _recognizer?.Stop();
-            await Task.Delay(300);
-        }
-
-        if (_ttsTask == null)
-        {
-            WriteError("TTS engine not available");
-            return;
-        }
-
-        // First use blocks until the model download/load completes; later calls return immediately.
-        if (!await _ttsTask || _tts == null)
-        {
-            WriteError("TTS engine not available");
-            return;
-        }
-
-        if (!await _tts.SpeakAsync(text, effectiveLang))
-        {
-            WriteError($"No TTS voice for language '{effectiveLang}'");
-        }
-
-        if (!streaming)
-        {
-            Log.LogStep("Non-streaming speak: restarting recognition after 500ms delay");
-            await Task.Delay(500);
-            _recognizer?.Start(_recognitionLang);
-            Log.LogStep("Recognition restarted after speak");
-        }
-    }
-
-    // ─── Helpers ──────────────────────────────────────────────────────────
-
-    private void StopAll()
-    {
-        Log.LogStep("StopAll");
-        _recognizer?.Stop();
-        _shutdownCts?.Cancel();
-    }
-
-    private static void WriteJson(object obj)
-    {
-        var json = JsonSerializer.Serialize(obj, new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        });
-        Console.WriteLine(json);
-    }
-
-    private static void WriteError(string message)
-    {
-        WriteJson(new { type = "error", text = message });
-    }
+    /// <summary>Streaming device sink on Linux/macOS (aplay/paplay over stdin); on Windows the
+    /// cross agent is used only for SIP rendering (no device playback), so no sink.</summary>
+    protected override IAudioSink? CreateAudioSink() =>
+        OperatingSystem.IsWindows() ? null : new ProcessAudioSink();
 }

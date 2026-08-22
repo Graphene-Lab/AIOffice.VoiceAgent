@@ -10,7 +10,7 @@ namespace AIOffice.VoiceAgent;
 /// energy-based VAD (adaptive noise floor + 700 ms silence hangover) and transcribes each
 /// utterance with whisper, raising <see cref="Transcript"/>.
 /// </summary>
-public sealed class WhisperRecognizer : IDisposable
+public sealed class WhisperRecognizer : IAgentRecognizer
 {
     /// <summary>Raised with the recognized text of a completed utterance.</summary>
     public event Action<string>? Transcript;
@@ -33,28 +33,55 @@ public sealed class WhisperRecognizer : IDisposable
     private CancellationTokenSource? _captureCts;
     private volatile bool _transcribing;
 
+    // External-input mode: the recognizer is fed PCM by the host (SIP media bridge) instead of
+    // capturing from the microphone. VAD + whisper live here either way — the media never
+    // re-implements them (architectural rule: media = I/O only, see ARCHITECTURE.md).
+    private bool _externalInput;
+
+    /// <summary>IAgentRecognizer — true when audio arrives via <see cref="FeedExternalPcm"/>.</summary>
+    public bool ExternalInput { get => _externalInput; set => _externalInput = value; }
+
+    /// <summary>IAgentRecognizer — starts recognition with the given language (auto-detect when
+    /// null/empty), using the current <see cref="ExternalInput"/> mode.</summary>
+    public Task StartAsync(string? lang) { Start(lang, ExternalInput); return Task.CompletedTask; }
+
+    /// <summary>IAgentRecognizer — stops recognition without disposing.</summary>
+    public Task StopAsync() { Stop(); return Task.CompletedTask; }
+
     // VAD state
     private MemoryStream _utterance = new();
     private DateTime _speechStart;
     private double _noiseFloor = 0.004;
     private int _hangover;
 
-    /// <summary>Starts capturing and recognizing. Idempotent. Null/empty language means auto-detect.</summary>
-    public void Start(string? language = "auto")
+    /// <summary>Starts capturing and recognizing. Idempotent. Null/empty language means auto-detect.
+    /// When <paramref name="externalInput"/> is true no microphone is opened: audio arrives via
+    /// <see cref="FeedExternalPcm"/> (the host pushes 16 kHz mono PCM chunks).</summary>
+    public void Start(string? language = "auto", bool externalInput = false)
     {
         lock (_sync)
         {
             if (_captureCts != null) return;
             _language = string.IsNullOrWhiteSpace(language) ? "auto" : language;
+            _externalInput = externalInput;
             _captureCts = new CancellationTokenSource();
-            Log.LogStep($"WhisperRecognizer starting (lang={_language})");
+            Log.LogStep($"WhisperRecognizer starting (lang={_language}, externalInput={externalInput})");
 
             try
             {
-                if (OperatingSystem.IsWindows())
+                if (externalInput)
+                {
+                    // No microphone: the host feeds PCM through FeedExternalPcm.
+                    Log.LogStep("External-input mode: awaiting host PCM");
+                }
+                else if (OperatingSystem.IsWindows())
+                {
                     StartWindowsCapture();
+                }
                 else
+                {
                     StartArecordCapture();
+                }
             }
             catch (Exception ex)
             {
@@ -63,6 +90,14 @@ public sealed class WhisperRecognizer : IDisposable
                 Stop();
             }
         }
+    }
+
+    /// <summary>Feeds an external PCM chunk (16 kHz mono, 16-bit) into the VAD → whisper chain.
+    /// Only valid in external-input mode. The host (SIP bridge) sends the decoded media here.</summary>
+    public void FeedExternalPcm(byte[] pcm)
+    {
+        if (!_externalInput || pcm == null || pcm.Length == 0) return;
+        ProcessPcm(pcm, pcm.Length);
     }
 
     /// <summary>Stops capturing. Pending transcription of a partial utterance is dropped.</summary>
@@ -293,6 +328,7 @@ public sealed class WhisperRecognizer : IDisposable
 
             Log.LogStep("Loading whisper model...");
             _factory = WhisperFactory.FromPath(Dependencies.ModelPath);
+            Log.LogStep($"Whisper runtime in use: {Whisper.net.LibraryLoader.RuntimeOptions.LoadedLibrary}");
             _processor = _factory.CreateBuilder().WithLanguage(_language).Build();
             _processorLanguage = _language;
             Log.LogStep($"Whisper model loaded (lang={_language})");

@@ -25,6 +25,7 @@ public class KokoroTts : IDisposable
     private KokoroTTS? _playback;
     private KokoroWavSynthesizer? _synth;
     private KokoroVoice? _defaultVoice;
+    private string? _modelPath;
     private bool _ready;
 
     /// <summary>TTS processing mode: Fast (SpeakFast, default) or Full (Speak).</summary>
@@ -87,7 +88,38 @@ public class KokoroTts : IDisposable
                 _playback = new KokoroTTS(modelPath);
             }
 
+            // PRE-WARM the streaming synthesizer: the streaming path (StreamToSinkAsync) and the
+            // render path (SynthesizePcm) need KokoroWavSynthesizer, which loads the ONNX model on
+            // construction. Creating it here (eagerly, at startup) removes the first-message
+            // latency — otherwise the FIRST chat reply pays the model load.
+            if (_modelPath == null) _modelPath = modelPath;
+            if (_synth == null && modelPath != null)
+            {
+                Log.LogStep("Kokoro TTS pre-warming the streaming synthesizer...");
+                _synth = new KokoroWavSynthesizer(modelPath);
+                Log.LogStep("Kokoro streaming synthesizer ready");
+            }
+
             _defaultVoice = KokoroVoiceManager.GetVoice("af_heart");
+
+            // WARM THE FIRST INFERENCE: the very first Synthesize() call pays the ONNX
+            // session/JIT + phonemizer warm-up (measured ~1-2 s on the FIRST real sentence).
+            // A one-word warm-up ("ok") is NOT enough: the phonemizer warms on real text, so
+            // warm up with an actual sentence to move the whole cost out of the first reply.
+            if (_synth != null && _defaultVoice != null)
+            {
+                try
+                {
+                    Log.LogStep("Kokoro TTS warming the first inference...");
+                    _synth.Synthesize("Questa è una breve prova di sintesi vocale.", _defaultVoice);
+                    Log.LogStep("Kokoro first-inference warm-up done");
+                }
+                catch (Exception ex)
+                {
+                    Log.LogStep($"Kokoro warm-up inference failed: {ex.Message}");
+                }
+            }
+
             _ready = true;
             Log.LogStep("Kokoro TTS loaded successfully");
             return true;
@@ -178,6 +210,89 @@ public class KokoroTts : IDisposable
         }
         return true;
     }
+
+    /// <summary>
+    /// Renders text to raw 16-bit PCM (no WAV header) with the voice matching
+    /// <paramref name="langCode"/>. Returns null when no engine/voice is available (the caller
+    /// may then fall back to the OS synthesizer) or an empty array for empty text.
+    /// Used by the SIP media bridge ("speak render") — playback-free, output-only.
+    /// </summary>
+    public byte[]? SynthesizePcm(string text, string? langCode)
+    {
+        if (!_ready) return null;
+        text = StripMarkdown(text);
+        if (string.IsNullOrEmpty(text)) return Array.Empty<byte>();
+
+        var useVoice = ResolveVoice(langCode, out var langUnsupported);
+        if (langUnsupported) return null;   // unsupported language → OS fallback
+        if (useVoice == null) return null;
+
+        // The synthesizer may not exist yet on Windows (playback engine only): create it lazily.
+        if (_synth == null)
+        {
+            if (_modelPath == null) return null;
+            _synth = new KokoroWavSynthesizer(_modelPath);
+        }
+        Log.LogStep($"Kokoro TTS render: {text.Length} chars, lang={langCode ?? "default"}");
+        return _synth.Synthesize(text, useVoice);
+    }
+
+    /// <summary>
+    /// STREAMING synthesis (the global, OS-agnostic path for TTS engines that support streaming):
+    /// renders each sentence to 24 kHz PCM via <see cref="KokoroWavSynthesizer"/> and pushes it
+    /// to <paramref name="sink"/> back-to-back — ONE continuous audio stream, no file, no gaps
+    /// (the media provides the sink: NAudio device on Windows, aplay/paplay stdin on Linux/macOS,
+    /// RTP in the SIP bridge). Returns false when the engine/voice is unavailable (the caller may
+    /// then fall back to the OS synthesizer or the parked file-based path).
+    ///
+    /// ARCHITECTURAL NOTE: the sentence splitting here is ONLY the driver of incremental synthesis
+    /// (Kokoro cannot synthesize partial tokens) — it is NOT a delivery strategy. Benchmark
+    /// (2026-08-22): feeding one long text vs many small chunks produces the SAME time-to-first-audio
+    /// (1650 ms, e2e/benchmark-chunking.ps1), because the first sound is bound by the FIRST sentence
+    /// synthesis. Smaller chunks would only add IPC overhead.
+    /// </summary>
+    public async Task<bool> StreamToSinkAsync(IEnumerable<string> sentences, string? langCode, IAudioSink sink)
+    {
+        if (!_ready) return false;
+
+        var useVoice = ResolveVoice(langCode, out var langUnsupported);
+        if (langUnsupported) return false;
+        if (useVoice == null) return false;
+
+        if (_synth == null)
+        {
+            if (_modelPath == null) return false;
+            _synth = new KokoroWavSynthesizer(_modelPath);
+        }
+
+        foreach (var sentence in sentences)
+        {
+            var text = StripMarkdown(sentence);
+            if (string.IsNullOrEmpty(text)) continue;
+            var pcm = _synth.Synthesize(text, useVoice);
+            if (pcm != null && pcm.Length > 0)
+                sink.Write(pcm);
+            await Task.Yield();   // keep the loop responsive (not a serialization barrier)
+        }
+        return true;
+    }
+
+    /// <summary>Resolves the voice for a language (or the default voice), reporting whether the
+    /// language is unsupported (null voice + langUnsupported → OS fallback).</summary>
+    private KokoroVoice? ResolveVoice(string? langCode, out bool langUnsupported)
+    {
+        langUnsupported = false;
+        KokoroVoice? voice = null;
+        if (langCode != null)
+        {
+            voice = GetVoiceForLanguage(langCode);
+            langUnsupported = voice == null;
+        }
+        return voice ?? _defaultVoice;
+    }
+
+    /// <summary>Sample rate of the Kokoro synthesizer output (used to tag rendered PCM).</summary>
+    public int SampleRate => KokoroPlayback.waveFormat.SampleRate;
 
     /// <summary>
     /// Locates the Kokoro ONNX model: the agent's own directory (standalone runs) or the parent
