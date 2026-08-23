@@ -129,6 +129,27 @@ public abstract class VoiceAgentBase
         WriteJson(ReadyPayload());
         Log.LogStep("Ready sent");
 
+        // The TTS engine finishes its warm-up in the background (Kokoro pre-warm + first
+        // inference, ~7 s) AFTER the "ready" line. The SIP bridge must not answer calls before
+        // it, or the first announcement would be silent ("first call after AgentBridge starts
+        // hears nothing"). Emit a dedicated readiness line once the engine is fully usable.
+        if (TtsTask != null)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await TtsTask;
+                    WriteJson(new { type = "tts-ready" });
+                }
+                catch (Exception ex)
+                {
+                    Log.LogStep($"TTS init failed: {ex.Message}");
+                    WriteJson(new { type = "error", text = "TTS engine initialization failed" });
+                }
+            });
+        }
+
         try
         {
             while (!_shutdownCts.Token.IsCancellationRequested)
