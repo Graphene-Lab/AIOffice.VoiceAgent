@@ -13,16 +13,28 @@
     <Description>Cross-platform voice agent executable (whisper.net STT + Kokoro TTS). Primary recognition on Linux/macOS, fallback on Windows.</Description>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!-- GPU acceleration opt-in: -p:WhisperGpu=true bundles the whisper.cpp CUDA12 + Vulkan
+         native runtimes (Vulkan is Windows-x64 only; on Linux the only GPU backend is CUDA).
+         The whisper.net loader probes them and FALLS BACK TO CPU automatically when no usable
+         GPU/driver is present, so a GPU-enabled build still works on every OS as distributed
+         (the CPU runtime is always bundled — GPU is an acceleration, never a prerequisite;
+         no CUDA toolkit install is needed, the packages carry their own libs). Default OFF:
+         the CPU-only package stays small and has zero GPU probe overhead. The runtime backend
+         can also be forced per process via AIOFFICE_WHISPER_DEVICE=auto|cuda|vulkan|cpu. -->
+    <WhisperGpu Condition="'$(WhisperGpu)' == ''">false</WhisperGpu>
+  </PropertyGroup>
+
   <ItemGroup>
     <!-- whisper.net: CPU runtime ships native libs for all supported RIDs (Win/Linux/macOS/Android/iOS).
          The ggml model is NOT bundled: it is downloaded automatically on first use.
          GPU runtimes (CUDA12/Vulkan) are OFF by default: on Turing-class GPUs (sm_75, e.g. GTX 16xx)
          the CUDA builds fail to load and the loader falls back to CPU WITH ~1.4s probe overhead per
-         model load. On Ampere+ (RTX 30xx/40xx) enable them by uncommenting the lines below:
-         <PackageReference Include="Whisper.net.Runtime.Cuda12" Version="1.9.1" />
-         <PackageReference Include="Whisper.net.Runtime.Vulkan" Version="1.9.1" /> -->
+         model load. On Ampere+ (RTX 30xx/40xx) enable them with -p:WhisperGpu=true. -->
     <PackageReference Include="Whisper.net" Version="1.9.1" />
     <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
+    <PackageReference Include="Whisper.net.Runtime.Cuda12" Version="1.9.1" Condition="'$(WhisperGpu)' == 'true'" />
+    <PackageReference Include="Whisper.net.Runtime.Vulkan" Version="1.9.1" Condition="'$(WhisperGpu)' == 'true'" />
     <!-- KokoroSharp.CPU: neural TTS with managed phonemization (no native espeak needed).
          Model (~320 MB) is downloaded automatically by KokoroTTS.LoadModel* on first use; voices ship in the package. -->
     <PackageReference Include="KokoroSharp.CPU" Version="0.8.4" />

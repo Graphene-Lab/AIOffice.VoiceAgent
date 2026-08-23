@@ -384,6 +384,7 @@ public sealed class WhisperRecognizer : IAgentRecognizer
             if (!File.Exists(Dependencies.ModelPath))
                 throw new InvalidOperationException($"Whisper model not found at {Dependencies.ModelPath}");
 
+            ApplyDevicePreference();   // must run before the first WhisperFactory load
             Log.LogStep("Loading whisper model...");
             _factory = WhisperFactory.FromPath(Dependencies.ModelPath);
             Log.LogStep($"Whisper runtime in use: {Whisper.net.LibraryLoader.RuntimeOptions.LoadedLibrary}");
@@ -396,6 +397,30 @@ public sealed class WhisperRecognizer : IAgentRecognizer
             _processorLanguage = _language;
             Log.LogStep($"Whisper model loaded (lang={_language}, threads={threads})");
             return _processor;
+        }
+    }
+
+    /// <summary>Selects the whisper.net runtime backend from AIOFFICE_WHISPER_DEVICE
+    /// (auto|cuda|vulkan|cpu). "auto" (default) lets the loader probe Cuda → Cuda12 → Vulkan →
+    /// CPU and falls back to CPU automatically when no usable GPU/driver is present; the forced
+    /// values pin a backend (the CPU runtime is ALWAYS bundled, so every value works on every OS
+    /// as distributed — GPU is an acceleration, never a prerequisite). "cpu" additionally skips
+    /// the failed-probe delay on machines whose GPU cannot run whisper (e.g. Turing sm_75, where
+    /// the CUDA build fails to load with ~1.4 s probe overhead per model load).</summary>
+    private static void ApplyDevicePreference()
+    {
+        var device = (Environment.GetEnvironmentVariable("AIOFFICE_WHISPER_DEVICE") ?? "auto").Trim().ToLowerInvariant();
+        List<Whisper.net.LibraryLoader.RuntimeLibrary>? order = device switch
+        {
+            "cpu" => new() { Whisper.net.LibraryLoader.RuntimeLibrary.Cpu },
+            "cuda" => new() { Whisper.net.LibraryLoader.RuntimeLibrary.Cuda, Whisper.net.LibraryLoader.RuntimeLibrary.Cuda12, Whisper.net.LibraryLoader.RuntimeLibrary.Cpu },
+            "vulkan" => new() { Whisper.net.LibraryLoader.RuntimeLibrary.Vulkan, Whisper.net.LibraryLoader.RuntimeLibrary.Cpu },
+            _ => null,   // auto: the loader's default probe order
+        };
+        if (order != null)
+        {
+            Whisper.net.LibraryLoader.RuntimeOptions.RuntimeLibraryOrder = order;
+            Log.LogStep($"Whisper device preference: {device} → {string.Join(", ", order)}");
         }
     }
 
