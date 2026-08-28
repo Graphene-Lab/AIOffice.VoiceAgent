@@ -341,9 +341,20 @@ public class KokoroTts : IDisposable
         catch { return null; }
     }
 
-    /// <summary>Removes markdown syntax from text so the TTS speaks only the actual content.</summary>
+    /// <summary>Removes markdown syntax from text so the TTS speaks only the actual content,
+    /// and canonicalizes apostrophes: every Unicode apostrophe variant → U+0027. Verified on
+    /// Kokoro: the phonemizer elides "l'amico" only with the ASCII apostrophe; the typographic
+    /// forms (U+2019/U+2018) are pronounced as a separate letter — the elision breaks.</summary>
     public static string StripMarkdown(string text)
     {
+        // Canonical apostrophe first (same normalization as AIOrchestrator.Utility.NormalizeForTts).
+        if (text.IndexOfAny(new[] { '\u2019', '\u2018', '\u02BC', '\u2032', '\u2033', '\uFF07' }) >= 0)
+        {
+            var sb = new System.Text.StringBuilder(text.Length);
+            foreach (var ch in text)
+                sb.Append(ch is '\u2019' or '\u2018' or '\u02BC' or '\u2032' or '\u2033' or '\uFF07' ? '\'' : ch);
+            text = sb.ToString();
+        }
         text = System.Text.RegularExpressions.Regex.Replace(text, @"```[\s\S]*?```", "");
         text = System.Text.RegularExpressions.Regex.Replace(text, @"`([^`]+)`", "$1");
         text = System.Text.RegularExpressions.Regex.Replace(text, @"!\[([^\]]*)\]\([^)]+\)", "$1");
