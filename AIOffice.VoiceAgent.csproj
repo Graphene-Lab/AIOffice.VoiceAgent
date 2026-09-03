@@ -19,7 +19,7 @@
        version 1.yy.MM.dd (e.g. 1.26.09.03). Publishing is an explicit act: pushing a tag v*
        triggers .github/workflows/publish.yml (a plain push is a code-only sync). -->
   <PropertyGroup>
-    <IsPrerelease>true</IsPrerelease>
+    <IsPrerelease>false</IsPrerelease>
     <Version Condition="'$(IsPrerelease)' == 'true'">$([System.DateTime]::Now.ToString("1.yy.MM.dd"))-prerelease</Version>
     <Version Condition="'$(IsPrerelease)' != 'true'">$([System.DateTime]::Now.ToString("1.yy.MM.dd"))</Version>
     <PackageId>Graphene.AIOffice.VoiceAgent</PackageId>
