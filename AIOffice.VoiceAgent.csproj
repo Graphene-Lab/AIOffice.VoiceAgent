@@ -13,6 +13,22 @@
     <Description>Cross-platform voice agent executable (whisper.net STT + Kokoro TTS). Primary recognition on Linux/macOS, fallback on Windows.</Description>
   </PropertyGroup>
 
+  <!-- NuGet packaging + release gate (Graphene-Lab convention, same scheme as AgentBridge):
+       IsPrerelease=true while iterating → the version gets "-prerelease". Set IsPrerelease=false
+       only when the test cycles proved the version works → a real release. Date-based auto
+       version 1.yy.MM.dd (e.g. 1.26.09.03). Publishing is an explicit act: pushing a tag v*
+       triggers .github/workflows/publish.yml (a plain push is a code-only sync). -->
+  <PropertyGroup>
+    <IsPrerelease>true</IsPrerelease>
+    <Version Condition="'$(IsPrerelease)' == 'true'">$([System.DateTime]::Now.ToString("1.yy.MM.dd"))-prerelease</Version>
+    <Version Condition="'$(IsPrerelease)' != 'true'">$([System.DateTime]::Now.ToString("1.yy.MM.dd"))</Version>
+    <PackageId>Graphene.AIOffice.VoiceAgent</PackageId>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Andrea Bruno</Copyright>
+    <RepositoryUrl>https://github.com/Graphene-Lab/AIOffice.VoiceAgent</RepositoryUrl>
+    <PackageTags>voice;agent;stt;tts;whisper;kokoro;llm;automation</PackageTags>
+  </PropertyGroup>
+
   <PropertyGroup>
     <!-- GPU acceleration opt-in: -p:WhisperGpu=true bundles the whisper.cpp CUDA12 + Vulkan
          native runtimes (Vulkan is Windows-x64 only; on Linux the only GPU backend is CUDA).
@@ -59,9 +75,11 @@
 
   <!-- Provide kokoro.onnx in the output directory (the 325 MB model binary is not tracked in git).
        This is the single home of the Kokoro model asset: AIOffice.VoiceAgent.Win no longer
-       downloads its own copy and reuses this one (deployed at the app base dir by the build). -->
+       downloads its own copy and reuses this one (deployed at the app base dir by the build).
+       Skipped while packing (_IsPacking=true is set by the dotnet CLI): the model is NOT part of
+       the NuGet package, so CI publication (publish.yml) must not download it. -->
   <Target Name="DownloadKokoroModel" BeforeTargets="Build;Publish"
-          Condition="!Exists('$(OutputPath)kokoro.onnx')">
+          Condition="'$(_IsPacking)' != 'true' and !Exists('$(OutputPath)kokoro.onnx')">
     <MakeDir Directories="$(OutputPath)" />
     <Copy Condition="Exists('kokoro.onnx')"
           SourceFiles="kokoro.onnx"
@@ -69,6 +87,45 @@
     <Exec Condition="!Exists('$(OutputPath)kokoro.onnx')"
           Command="curl.exe -L --fail -o &quot;$(OutputPath)kokoro.onnx&quot; &quot;https://github.com/Lyrcaxis/KokoroSharpBinaries/releases/download/v2.0.0/kokoro.onnx&quot;" />
     <Message Text="kokoro.onnx ready at $(OutputPath)" Importance="high" />
+  </Target>
+
+  <!-- The README is referenced by PackageReadmeFile above and must travel inside the nupkg.
+       Explicit Include (not None Update): the default-items pass yields an empty @(None) in the
+       multi-TFM pack evaluation, so an Update would never match and pack fails with NU5039. -->
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- Date-based auto version + NuGet publishing, same mechanism as the other Graphene repos
+       (DocumentTool/AIOrchestrator). Local/VS: `dotnet pack` publishes with the NuGetApiKey env
+       var; CI: .github/workflows/publish.yml pushes the package (pack runs with SkipNuGetPush). -->
+  <Target Name="SetPackageVersion" DependsOnTargets="Build">
+    <PropertyGroup>
+      <PackageVersion>$(Version)</PackageVersion>
+    </PropertyGroup>
+  </Target>
+
+  <PropertyGroup>
+    <NuGetSource Condition="'$(NuGetSource)' == ''">https://api.nuget.org/v3/index.json</NuGetSource>
+  </PropertyGroup>
+
+  <Target Name="CleanOldNuGetPackages" BeforeTargets="GenerateNuspec">
+    <CreateItem Include="$(PackageOutputPath)*.nupkg">
+      <Output TaskParameter="Include" ItemName="_OldNupkg" />
+    </CreateItem>
+    <Delete Files="@(_OldNupkg)" />
+  </Target>
+
+  <Target Name="PublishPackageToNuGet" AfterTargets="Pack" Condition="'$(SkipNuGetPush)' != 'true'">
+    <Error Condition="'$(NuGetApiKey)' == ''"
+           Text="NuGetApiKey env var not set: run `setx NuGetApiKey &lt;key&gt;` and restart Visual Studio." />
+    <CreateItem Include="$(PackageOutputPath)*.nupkg">
+      <Output TaskParameter="Include" ItemName="_NuGetPackageToPush" />
+    </CreateItem>
+    <Error Condition="'@(_NuGetPackageToPush)' == ''"
+           Text="No package found in $(PackageOutputPath): pack produced no expected file." />
+    <Message Importance="High" Text="Publishing %(_NuGetPackageToPush.Identity) to $(NuGetSource) ..." />
+    <Exec Command="dotnet nuget push &quot;%(_NuGetPackageToPush.Identity)&quot; --api-key &quot;$(NuGetApiKey)&quot; --source &quot;$(NuGetSource)&quot; --skip-duplicate" />
   </Target>
 
 </Project>
