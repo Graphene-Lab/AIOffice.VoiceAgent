@@ -57,3 +57,8 @@ AIOffice.VoiceAgent [--check] [--debug] [--tts-method fast|full] [--pipe-audio] 
 ```
 
 - `--check` — verify/install all dependencies, load the whisper model and exit (used by CI and to pre-warm).
+
+## License
+
+GNU Affero General Public License v3.0 (AGPL-3.0) — see [LICENSE.md](LICENSE.md). The licence file
+ships inside the NuGet package and in the publish output.

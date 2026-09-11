@@ -91,9 +91,12 @@
 
   <!-- The README is referenced by PackageReadmeFile above and must travel inside the nupkg.
        Explicit Include (not None Update): the default-items pass yields an empty @(None) in the
-       multi-TFM pack evaluation, so an Update would never match and pack fails with NU5039. -->
+       multi-TFM pack evaluation, so an Update would never match and pack fails with NU5039.
+       LICENSE.md follows the same rule and also travels with the publish output: AGPL-3.0
+       requires the licence to accompany the binaries. -->
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="LICENSE.md" Pack="true" PackagePath="\" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- Date-based auto version + NuGet publishing, same mechanism as the other Graphene repos
